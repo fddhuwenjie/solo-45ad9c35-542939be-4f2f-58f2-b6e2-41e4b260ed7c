@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>闸门群推演工作台</title>
+<style>
+  :root { --bd:#c9d2dc; --bg:#f5f7fa; --ok:#0a7d3b; --bad:#b3261e; --warn:#9a6a00; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 "PingFang SC","Microsoft YaHei",sans-serif; margin:0; background:var(--bg); color:#1c2733; }
+  header { background:#12365c; color:#fff; padding:10px 18px; font-size:17px; }
+  main { display:grid; grid-template-columns: 340px 1fr; gap:12px; padding:12px; }
+  section { background:#fff; border:1px solid var(--bd); border-radius:6px; padding:12px; }
+  h2 { font-size:15px; margin:0 0 10px; border-bottom:1px solid var(--bd); padding-bottom:6px; }
+  h3 { font-size:13px; margin:14px 0 6px; color:#12365c; }
+  label { display:block; margin:6px 0 2px; color:#46586b; font-size:12px; }
+  input, select { width:100%; padding:5px 7px; border:1px solid var(--bd); border-radius:4px; }
+  button { padding:6px 14px; border:1px solid #12365c; background:#12365c; color:#fff;
+           border-radius:4px; cursor:pointer; margin:4px 4px 0 0; }
+  button.ghost { background:#fff; color:#12365c; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  table { border-collapse:collapse; width:100%; font-size:12.5px; }
+  th, td { border:1px solid var(--bd); padding:4px 7px; text-align:right; }
+  th { background:#eef3f8; }
+  td.l, th.l { text-align:left; }
+  .locked-row { background:#fff7e0; }
+  .alert { padding:8px 10px; border-radius:4px; margin:8px 0; display:none; }
+  .alert.err { display:block; background:#fdecea; color:var(--bad); border:1px solid #f5c6c2; }
+  .alert.ok  { display:block; background:#e8f5ec; color:var(--ok); border:1px solid #bfe3cc; }
+  .alert.warn{ display:block; background:#fff7e0; color:var(--warn); border:1px solid #ecd9a0; }
+  .diag { background:#fdecea; border:1px solid #f5c6c2; border-radius:4px; padding:10px; margin-top:10px; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size:12px; word-break:break-all; }
+  canvas { width:100%; height:240px; border:1px solid var(--bd); border-radius:4px; background:#fff; }
+  .plan-item { padding:6px 8px; border:1px solid var(--bd); border-radius:4px; margin-bottom:6px; cursor:pointer; }
+  .plan-item.sel { border-color:#12365c; background:#eef3f8; }
+  .tag { display:inline-block; padding:1px 7px; border-radius:8px; font-size:11px; margin-left:6px; }
+  .tag.draft { background:#e3ecf5; color:#12365c; }
+  .tag.sealed { background:#e8f5ec; color:var(--ok); }
+  .row { display:flex; gap:8px; } .row > div { flex:1; }
+</style>
+</head>
+<body>
+<header>闸门群开度推演工作台</header>
+<main>
+  <div>
+    <section>
+      <h2>闸门状态</h2>
+      <div id="gates"></div>
+    </section>
+    <section style="margin-top:12px">
+      <h2>新建方案</h2>
+      <label>方案名</label><input id="p-name" value="日常泄量调整">
+      <div class="row">
+        <div><label>水头 (m)</label><input id="p-head" type="number" value="15" step="0.1"></div>
+        <div><label>目标泄量 (m³/s)</label><input id="p-target" type="number" value="900"></div>
+      </div>
+      <div class="row">
+        <div><label>总泄量爬升率 (m³/s/步)</label><input id="p-ramp" type="number" value="30"></div>
+        <div><label>相邻门开度差上限 (m)</label><input id="p-adj" type="number" value="2.0" step="0.1"></div>
+      </div>
+      <label>当前各门开度 (m，逗号分隔)</label>
+      <input id="p-start" value="4.0,4.0,4.0,4.0">
+      <label>操作员</label><input id="p-user" value="dispatcher-A">
+      <button id="btn-create">创建方案</button>
+    </section>
+    <section style="margin-top:12px">
+      <h2>方案列表</h2>
+      <div id="plan-list"></div>
+    </section>
+  </div>
+
+  <div>
+    <section>
+      <h2>推演 <span id="plan-meta"></span></h2>
+      <div id="msg" class="alert"></div>
+      <div>
+        <button id="btn-solve" disabled>开始推演</button>
+        <button id="btn-seal" class="ghost" disabled>封定方案</button>
+        <button id="btn-refresh" class="ghost" disabled>刷新最新版本</button>
+      </div>
+      <div id="diag"></div>
+      <h3>开度过程</h3>
+      <canvas id="chart" width="900" height="240"></canvas>
+      <h3>步骤</h3>
+      <div style="max-height:320px; overflow:auto">
+        <table id="steps-table">
+          <thead><tr><th>步</th><th class="l">各门开度 (m)</th><th>总泄量 (m³/s)</th><th>操作</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+    <section style="margin-top:12px">
+      <h2>封定回放</h2>
+      <div>
+        <button id="btn-prev" class="ghost" disabled>上一步</button>
+        <button id="btn-next" class="ghost" disabled>下一步</button>
+        <span id="replay-info"></span>
+      </div>
+      <p>摘要：<span id="digest" class="mono">—</span> <span id="digest-stable"></span></p>
+    </section>
+  </div>
+</main>
+
+<script>
+let plan = null;          // 当前方案（含 version）
+let steps = [];           // 当前步骤
+let gates = [];
+let replaySeq = 0, replayTotal = 0;
+
+const $ = id => document.getElementById(id);
+const fmt = a => a.map(x => x.toFixed(1)).join(", ");
+
+async function api(path, method = "GET", body) {
+  const r = await fetch(path, {
+    method,
+    headers: body ? {"Content-Type": "application/json"} : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return {status: r.status, data: await r.json()};
+}
+
+function showMsg(kind, text) {
+  const m = $("msg");
+  m.className = "alert " + kind;
+  m.textContent = text;
+}
+function clearMsg() { $("msg").className = "alert"; }
+
+async function loadGates() {
+  const {data} = await api("/api/gates");
+  gates = data.gates;
+  $("gates").innerHTML = "";
+  for (const g of gates) {
+    const bands = data.bands.filter(b => b.gate_id === g.id)
+      .map(b => `水头${b.head_lo}~${b.head_hi}m: ${b.open_lo}~${b.open_hi}m`).join("；");
+    const div = document.createElement("div");
+    div.innerHTML = `<b>${g.name}</b>（上限${g.max_opening}m，速率${g.rate}m/步）
+      <span class="tag ${g.locked ? "sealed" : "draft"}">${g.locked ? "检修锁定" : "可调"}</span>
+      <br><small>${bands}</small><br>`;
+    const btn = document.createElement("button");
+    btn.className = "ghost";
+    btn.textContent = g.locked ? "解除锁定" : "检修锁定";
+    btn.onclick = async () => { await api(`/api/gates/${g.id}/maintenance`, "POST", {locked: !g.locked}); loadGates(); };
+    div.appendChild(btn);
+    $("gates").appendChild(div);
+  }
+}
+
+async function loadPlans() {
+  const {data} = await api("/api/plans");
+  $("plan-list").innerHTML = "";
+  for (const p of data.plans) {
+    const div = document.createElement("div");
+    div.className = "plan-item" + (plan && plan.id === p.id ? " sel" : "");
+    div.innerHTML = `#${p.id} ${p.name} <span class="tag ${p.status}">${p.status === "sealed" ? "已封定" : "草稿"}</span>
+      <br><small>水头${p.head}m → 目标${p.target_q}m³/s · v${p.version} · ${p.created_by}</small>`;
+    div.onclick = () => selectPlan(p.id);
+    $("plan-list").appendChild(div);
+  }
+}
+
+async function selectPlan(id) {
+  const {data} = await api(`/api/plans/${id}`);
+  plan = data.plan; steps = data.steps;
+  replayTotal = steps.length;
+  renderAll();
+}
+
+function renderAll() {
+  clearMsg(); $("diag").innerHTML = "";
+  if (!plan) return;
+  $("plan-meta").textContent = `— #${plan.id} ${plan.name}（v${plan.version}，锁定前缀 ${plan.locked_seq + 1} 步）`;
+  $("btn-solve").disabled = plan.status === "sealed";
+  $("btn-seal").disabled = plan.status === "sealed" || steps.length === 0;
+  $("btn-refresh").disabled = false;
+  $("btn-prev").disabled = $("btn-next").disabled = plan.status !== "sealed";
+  $("digest").textContent = plan.digest || "—";
+  $("digest-stable").textContent = "";
+  renderSteps(); renderChart(steps);
+}
+
+function renderSteps() {
+  const tb = document.querySelector("#steps-table tbody");
+  tb.innerHTML = "";
+  for (const s of steps) {
+    const locked = s.seq <= plan.locked_seq;
+    const tr = document.createElement("tr");
+    if (locked) tr.className = "locked-row";
+    tr.innerHTML = `<td>${s.seq}</td><td class="l">${fmt(s.openings)}</td>
+      <td>${s.total_q.toFixed(1)}</td><td></td>`;
+    const td = tr.lastChild;
+    if (plan.status !== "sealed") {
+      const btn = document.createElement("button");
+      btn.className = "ghost"; btn.textContent = locked ? "已锁定" : "锁定此步";
+      btn.disabled = locked;
+      btn.onclick = () => lockStep(s.seq);
+      td.appendChild(btn);
+    }
+    tb.appendChild(tr);
+  }
+}
+
+function renderChart(st) {
+  const cv = $("chart"), ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  if (!st || st.length === 0) return;
+  const nGates = st[0].openings.length;
+  const colors = ["#12365c", "#0a7d3b", "#b3261e", "#9a6a00", "#6a3fb5", "#0a7d8c"];
+  const maxE = Math.max(...st.flatMap(s => s.openings), 1);
+  const x = i => 40 + i * (cv.width - 60) / Math.max(st.length - 1, 1);
+  const y = v => cv.height - 20 - v * (cv.height - 50) / maxE;
+  ctx.strokeStyle = "#c9d2dc";
+  ctx.beginPath(); ctx.moveTo(40, 10); ctx.lineTo(40, cv.height - 20); ctx.lineTo(cv.width - 20, cv.height - 20); ctx.stroke();
+  for (let g = 0; g < nGates; g++) {
+    ctx.strokeStyle = colors[g % colors.length]; ctx.beginPath();
+    st.forEach((s, i) => { const px = x(i), py = y(s.openings[g]); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); });
+    ctx.stroke();
+    ctx.fillStyle = colors[g % colors.length];
+    ctx.fillText(`${gates[g] ? gates[g].name : "门" + (g + 1)}`, 44, 16 + g * 14);
+  }
+  ctx.fillStyle = "#46586b";
+  ctx.fillText(`末步总泄量 ${st[st.length - 1].total_q.toFixed(1)} m³/s`, cv.width - 220, 16);
+}
+
+async function handleConflict(res) {
+  if (res.status === 409 && res.data.error === "version_conflict") {
+    showMsg("err", `版本冲突：他人已提交，当前版本 v${res.data.current_version}。请刷新后重试。`);
+    return true;
+  }
+  if (res.status === 409 && res.data.error === "sealed") {
+    showMsg("err", "方案已封定，不可修改。"); return true;
+  }
+  if (res.status >= 400) { showMsg("err", res.data.message || res.data.error); return true; }
+  return false;
+}
+
+$("btn-create").onclick = async () => {
+  const body = {
+    name: $("p-name").value, head: +$("p-head").value, target_q: +$("p-target").value,
+    ramp: +$("p-ramp").value, max_adj_diff: +$("p-adj").value,
+    start_openings: $("p-start").value.split(",").map(Number),
+    created_by: $("p-user").value,
+  };
+  const res = await api("/api/plans", "POST", body);
+  if (!(await handleConflict(res))) { showMsg("ok", `方案 #${res.data.id} 已创建`); loadPlans(); selectPlan(res.data.id); }
+};
+
+$("btn-solve").onclick = async () => {
+  clearMsg(); $("diag").innerHTML = "";
+  const res = await api(`/api/plans/${plan.id}/solve`, "POST", {base_version: plan.version});
+  if (await handleConflict(res)) return;
+  const d = res.data;
+  if (d.ok) {
+    plan.version = d.version;
+    steps = d.steps;
+    showMsg("ok", `推演成功：${steps.length} 步（保留锁定前缀 ${d.locked_prefix} 步，扩展节点 ${d.expanded}）`);
+    renderAll();
+  } else {
+    $("diag").innerHTML = `<div class="diag"><b>无可行路径。</b><br>
+      首个不可满足约束：<b>${d.first_violated}</b> — ${d.detail}<br>
+      最近可达状态：开度 [${fmt(d.nearest_state)}]，总泄量 ${d.nearest_q.toFixed(1)} m³/s
+      （目标 ${plan.target_q}）</div>`;
+  }
+  loadPlans();
+};
+
+async function lockStep(seq) {
+  const res = await api(`/api/plans/${plan.id}/lock`, "POST", {seq, base_version: plan.version});
+  if (await handleConflict(res)) return;
+  plan.locked_seq = res.data.locked_seq; plan.version = res.data.version;
+  showMsg("ok", `已锁定第 ${seq} 步，重新推演将保留前 ${seq + 1} 步。`);
+  renderAll();
+}
+
+$("btn-seal").onclick = async () => {
+  const res = await api(`/api/plans/${plan.id}/seal`, "POST", {base_version: plan.version});
+  if (await handleConflict(res)) return;
+  plan.status = "sealed"; plan.version = res.data.version; plan.digest = res.data.digest;
+  showMsg("ok", `已封定，共 ${res.data.steps} 步。`);
+  renderAll(); loadPlans();
+};
+
+$("btn-refresh").onclick = () => selectPlan(plan.id);
+
+async function replay(d) {
+  replaySeq = Math.min(Math.max(replaySeq + d, 0), replayTotal - 1);
+  const res = await api(`/api/plans/${plan.id}/replay/${replaySeq}`);
+  if (await handleConflict(res)) return;
+  const s = res.data;
+  $("replay-info").textContent = `第 ${s.seq}/${s.total_steps - 1} 步 · 开度 [${fmt(s.openings)}] · 总泄量 ${s.total_q.toFixed(1)} m³/s`;
+  $("digest").textContent = s.digest;
+  $("digest-stable").textContent = s.digest_stable ? "✓ 摘要稳定" : "✗ 摘要不一致";
+  $("digest-stable").style.color = s.digest_stable ? "var(--ok)" : "var(--bad)";
+}
+$("btn-prev").onclick = () => replay(-1);
+$("btn-next").onclick = () => replay(1);
+
+loadGates(); loadPlans();
+</script>
+</body>
+</html>
