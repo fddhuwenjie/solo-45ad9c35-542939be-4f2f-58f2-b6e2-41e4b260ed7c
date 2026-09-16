@@ -176,6 +176,49 @@ class BandInteriorStartTest(unittest.TestCase):
             self.assertLessEqual(
                 abs(res.nearest_state[i] - res.nearest_state[i + 1]), ADJ + 1e-6)
 
+    def test_zero_rate_gate_not_moved_by_suggestion(self):
+        # 1#门零速率且卡在禁振带内：无合法可达状态，不得建议移动它
+        gates = make_gates()
+        gates[0].rate = 0.0
+        res = search.find_path(gates, make_bands(), HEAD,
+                               [2.6, 4.0, 4.0, 4.0], 900.0, RAMP, ADJ,
+                               inflow=5000.0)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.first_violated, "rate")
+        self.assertIsNone(res.nearest_state)  # 违规状态不得展示为调整目标
+        self.assertIsNone(res.nearest_q)
+
+    def test_locked_gate_not_moved_by_suggestion(self):
+        # 1#门检修锁定且卡在禁振带内：首报检修锁定，不给违规建议
+        gates = make_gates(locked=(1,))
+        res = search.find_path(gates, make_bands(), HEAD,
+                               [2.6, 4.0, 4.0, 4.0], 900.0, RAMP, ADJ,
+                               inflow=5000.0)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.first_violated, "maintenance")
+        self.assertIsNone(res.nearest_state)
+        self.assertIsNone(res.nearest_q)
+
+    def test_escape_suggestion_respects_inflow(self):
+        # 来流 700：最近的合法状态必须满足 Q ≤ 700，
+        # 不得返回泄量 740.708 的 [3.3, 4.0, 4.0, 4.0]
+        res = search.find_path(make_gates(), make_bands(), HEAD,
+                               [2.6, 4.0, 4.0, 4.0], 900.0, RAMP, ADJ,
+                               inflow=700.0)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.first_violated, "start")
+        self.assertIsNotNone(res.nearest_state)
+        self.assertLessEqual(res.nearest_q, 700.0 + 1e-6)
+        self.assertNotAlmostEqual(res.nearest_q, 740.708, places=2)
+        # 建议状态本身合法：出禁振带、满足相邻差
+        for i, e in enumerate(res.nearest_state):
+            for b in make_bands():
+                if b.gate_id == i + 1:
+                    self.assertFalse(b.open_lo <= e <= b.open_hi)
+        for i in range(len(res.nearest_state) - 1):
+            self.assertLessEqual(
+                abs(res.nearest_state[i] - res.nearest_state[i + 1]), ADJ + 1e-6)
+
 
 class ServerTestBase(unittest.TestCase):
     @classmethod

@@ -76,7 +76,8 @@ class _Problem:
     """一次搜索的约束上下文；relax 用于诊断时松弛某类约束。"""
 
     def __init__(self, gates, bands, head, ramp, max_adj_diff, start,
-                 inflow: float = math.inf, relax: str | None = None):
+                 inflow: float = math.inf, relax: str | None = None,
+                 escape: bool = False):
         self.gates = gates
         self.head = head
         self.ramp = ramp
@@ -110,7 +111,9 @@ class _Problem:
                         self.in_band[k][i] = True
 
         # 把每门钳制到起点所在的连通区间（禁振带不可穿越）；
-        # 检修锁定门与零速率门（无法移动）直接钳制到起点
+        # 检修锁定门与零速率门（无法移动）直接钳制到起点。
+        # 逃逸模式（起点本身非法）不做区间钳制：可动门全范围移动，
+        # 合法性改由逃逸搜索的目标判定负责。
         self.lo = [0] * len(gates)
         self.hi = list(self.max_grid)
         for k in range(len(gates)):
@@ -118,6 +121,8 @@ class _Problem:
                      or (self.rate_steps[k] == 0 and relax != "rate"))
             if fixed:
                 self.lo[k] = self.hi[k] = start[k]
+                continue
+            if escape:
                 continue
             s = start[k]
             lo, hi = 0, self.max_grid[k]
@@ -150,6 +155,7 @@ class _Problem:
         # 相邻门开度差检查的门对（网格步数上限）
         self._pairs = [(k, k + 1) for k in range(len(gates) - 1)]
         self._max_adj_grid = max_adj_diff / GRID
+        self.escape = escape
 
     def q_of(self, state: tuple[int, ...]) -> float:
         return sum(self.q_contrib[k][state[k]] for k in range(len(state)))
@@ -174,7 +180,9 @@ class _Problem:
                   if abs(q - target_q) <= 2 * self.ramp else self._coarse_combos)
         lo, hi, qc = self.lo, self.hi, self.q_contrib
         ramp = self.ramp if self.relax != "ramp" else math.inf
-        inflow = self.inflow
+        # 逃逸模式下来流上限只约束目标状态，不约束途经状态
+        # （当前物理状态的泄量本身可能已超来流）
+        inflow = math.inf if self.escape else self.inflow
         check_adj = self.relax != "adj_diff"
         max_adj = self._max_adj_grid
         for deltas in combos:
@@ -260,48 +268,88 @@ def _diagnose(gates, bands, head, start, target_q, ramp, max_adj_diff, inflow):
     return "target", "即使松弛全部运行约束仍不可达：目标泄量超出机组来流能力范围。"
 
 
-def _legalize_start(prob: _Problem, start: tuple[int, ...]) -> tuple[int, ...]:
-    """把落在禁振带内的各门移到最近合法开度，并尽量修复相邻开度差。
+def _escape_to_legal(prob: _Problem, start: tuple[int, ...],
+                     max_expand: int = 50_000):
+    """从非法起点（禁振带内/相邻差违规）搜索最近的合法状态。
 
-    用于"当前开度已在禁振带内"时的最近合法状态提示。
+    合法 = 各门出禁振带 + 相邻开度差 + 总泄量 ≤ 机组来流；
+    移动受单门速率与检修锁定约束（不可动门保持原开度）。
+    代价为 L1 开度距离（各门移动网格数之和），保证"最近"。
+    返回 (state, q)；不存在满足全部约束的可达状态时返回 (None, None)。
     """
-    n = len(start)
-    in_band, max_grid = prob.in_band, prob.max_grid
+    def legal(state, q):
+        if q > prob.inflow + 1e-9:
+            return False
+        if any(prob.in_band[k][state[k]] for k in range(len(state))):
+            return False
+        return prob.state_ok(state)
 
-    def nearest_legal(k, g, lo=0, hi=None):
-        hi = max_grid[k] if hi is None else min(hi, max_grid[k])
-        lo = max(lo, 0)
-        g = min(max(g, lo), hi)
-        if not in_band[k][g]:
-            return g
-        for d in range(1, max_grid[k] + 1):
-            if g + d <= hi and not in_band[k][g + d]:
-                return g + d
-            if g - d >= lo and not in_band[k][g - d]:
-                return g - d
-        return g  # 窗口内无合法点开度（理论上不会发生）
-
-    st = [nearest_legal(k, start[k]) for k in range(n)]
-    limit = prob._max_adj_grid
-    for _ in range(2 * n):
-        changed = False
-        for a, b in prob._pairs:
-            if abs(st[a] - st[b]) <= limit + 1e-9:
+    def h(state):
+        # 各在带门移到最近带外网格的距离之和（对 L1 代价可采纳）
+        d = 0
+        for k, s in enumerate(state):
+            if not prob.in_band[k][s]:
                 continue
-            # 把偏离更大的一侧拉向另一侧的允许窗口
-            if st[b] - st[a] > limit:
-                k, other = b, a
-            else:
-                k, other = a, b
-            lo_w = int(math.ceil(st[other] - limit - 1e-9))
-            hi_w = int(math.floor(st[other] + limit + 1e-9))
-            new_v = nearest_legal(k, st[k], lo_w, hi_w)
-            if new_v != st[k]:
-                st[k] = new_v
-                changed = True
-        if not changed:
-            break
-    return tuple(st)
+            up = s
+            while up <= prob.max_grid[k] and prob.in_band[k][up]:
+                up += 1
+            down = s
+            while down >= 0 and prob.in_band[k][down]:
+                down -= 1
+            d += min(up - s if up <= prob.max_grid[k] else 10 ** 6,
+                     s - down if down >= 0 else 10 ** 6)
+        return float(d)
+
+    start_q = prob.q_of(start)
+    # 不可动门（锁定/零速率，lo==hi==start）本身在带内 → 必然无解
+    for k in range(len(start)):
+        if (prob.in_band[k][start[k]]
+                and prob.lo[k] == prob.hi[k] == start[k]):
+            return None, None
+    if legal(start, start_q):
+        return start, start_q
+    counter = itertools.count()
+    heap = [(h(start), 0.0, next(counter), start, start_q)]
+    best = {start: 0.0}
+    expanded = 0
+    while heap and expanded < max_expand:
+        _, g, _, state, q = heapq.heappop(heap)
+        if g > best.get(state, math.inf):
+            continue
+        expanded += 1
+        if legal(state, q):
+            return state, q
+        for nxt, nq in prob.neighbors(state, q, target_q=q):
+            ng = g + sum(abs(a - b) for a, b in zip(nxt, state))
+            if ng < best.get(nxt, math.inf):
+                best[nxt] = ng
+                heapq.heappush(heap, (ng + h(nxt), ng, next(counter), nxt, nq))
+    return None, None
+
+
+def _diagnose_escape(gates, bands, head, start, ramp, max_adj_diff, inflow):
+    """逃逸失败时报告首个不可满足约束（确定性顺序）。"""
+    probe = _Problem(gates, bands, head, ramp, max_adj_diff, start,
+                     inflow=inflow, escape=True)
+    # 最具体的原因优先：不可动门（检修锁定/零速率）本身就在禁振带内
+    for k, g in enumerate(gates):
+        if probe.in_band[k][start[k]]:
+            if g.locked:
+                return ("maintenance",
+                        f"检修锁定：{g.name} 锁定在禁振带内，无法移出，"
+                        "请先解除锁定或人工处置")
+            if probe.rate_steps[k] == 0:
+                return ("rate",
+                        f"单门速率限制：{g.name} 速率为 0 且处于禁振带内，"
+                        "无法自动移出，请人工处置")
+    # 其次按统一松弛顺序诊断（来流、相邻差等）
+    for key, msg in _RELAX_ORDER:
+        prob = _Problem(gates, bands, head, ramp, max_adj_diff, start,
+                        inflow=inflow, relax=key, escape=True)
+        legal, _ = _escape_to_legal(prob, start)
+        if legal is not None:
+            return key, msg
+    return "start", "不存在满足全部约束的可达合法状态，请人工检查闸门与来流。"
 
 
 def _nearest_under_inflow(prob: _Problem) -> tuple[tuple[int, ...], float]:
@@ -336,20 +384,25 @@ def find_path(gates: list[Gate], bands: list[Band], head: float,
               max_adj_diff: float, inflow: float = math.inf) -> SearchResult:
     start = _to_grid(start_openings)
     prob = _Problem(gates, bands, head, ramp, max_adj_diff, start, inflow=inflow)
-    if any(prob.in_band[k][start[k]] for k in range(len(start))):
-        # 当前开度已在禁振带内：给出最近的合法可达状态及对应泄量
-        legal = _legalize_start(prob, start)
-        return SearchResult(
-            ok=False, first_violated="start",
-            detail="当前开度处于禁振带内，请先调整至最近的合法开度。",
-            nearest_state=list(_to_meters(legal)),
-            nearest_q=round(prob.q_of(legal), 3))
-    if not prob.state_ok(start):
-        legal = _legalize_start(prob, start)
-        return SearchResult(ok=False, first_violated="start",
-                            detail="当前开度违反相邻门开度差约束，请先人工调整。",
-                            nearest_state=list(_to_meters(legal)),
-                            nearest_q=round(prob.q_of(legal), 3))
+    start_bad = (any(prob.in_band[k][start[k]] for k in range(len(start)))
+                 or not prob.state_ok(start))
+    if start_bad:
+        # 当前开度非法：在全部约束（速率/锁定/来流/相邻差/禁振带）下
+        # 搜索最近的合法可达状态作为调整建议
+        esc = _Problem(gates, bands, head, ramp, max_adj_diff, start,
+                       inflow=inflow, escape=True)
+        legal, legal_q = _escape_to_legal(esc, start)
+        if legal is not None:
+            return SearchResult(
+                ok=False, first_violated="start",
+                detail="当前开度处于禁振带内或违反相邻差约束，"
+                       "请先调整至最近的合法开度。",
+                nearest_state=list(_to_meters(legal)),
+                nearest_q=round(legal_q, 3))
+        # 不存在满足全部约束的可达合法状态：不得给出违规建议
+        key, msg = _diagnose_escape(gates, bands, head, start,
+                                    ramp, max_adj_diff, inflow)
+        return SearchResult(ok=False, first_violated=key, detail=msg)
 
     lo_q, hi_q = prob.q_range()
     hi_eff = min(hi_q, prob.inflow)
