@@ -46,7 +46,7 @@ def solve(conn: sqlite3.Connection, plan_id: int, base_version: int) -> dict:
 
     result = search.find_path(
         gates, bands, plan["head"], start, plan["target_q"],
-        plan["ramp"], plan["max_adj_diff"])
+        plan["ramp"], plan["max_adj_diff"], inflow=plan["inflow"])
 
     out: dict = {"ok": result.ok, "expanded": result.expanded,
                  "locked_prefix": locked_seq + 1}

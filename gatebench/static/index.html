@@ -54,7 +54,10 @@
         <div><label>目标泄量 (m³/s)</label><input id="p-target" type="number" value="900"></div>
       </div>
       <div class="row">
+        <div><label>机组来流 (m³/s)</label><input id="p-inflow" type="number" value="1500"></div>
         <div><label>总泄量爬升率 (m³/s/步)</label><input id="p-ramp" type="number" value="30"></div>
+      </div>
+      <div class="row">
         <div><label>相邻门开度差上限 (m)</label><input id="p-adj" type="number" value="2.0" step="0.1"></div>
       </div>
       <label>当前各门开度 (m，逗号分隔)</label>
@@ -152,7 +155,7 @@ async function loadPlans() {
     const div = document.createElement("div");
     div.className = "plan-item" + (plan && plan.id === p.id ? " sel" : "");
     div.innerHTML = `#${p.id} ${p.name} <span class="tag ${p.status}">${p.status === "sealed" ? "已封定" : "草稿"}</span>
-      <br><small>水头${p.head}m → 目标${p.target_q}m³/s · v${p.version} · ${p.created_by}</small>`;
+      <br><small>水头${p.head}m → 目标${p.target_q}m³/s · 来流${p.inflow}m³/s · v${p.version} · ${p.created_by}</small>`;
     div.onclick = () => selectPlan(p.id);
     $("plan-list").appendChild(div);
   }
@@ -236,6 +239,7 @@ async function handleConflict(res) {
 $("btn-create").onclick = async () => {
   const body = {
     name: $("p-name").value, head: +$("p-head").value, target_q: +$("p-target").value,
+    inflow: +$("p-inflow").value,
     ramp: +$("p-ramp").value, max_adj_diff: +$("p-adj").value,
     start_openings: $("p-start").value.split(",").map(Number),
     created_by: $("p-user").value,
@@ -255,10 +259,12 @@ $("btn-solve").onclick = async () => {
     showMsg("ok", `推演成功：${steps.length} 步（保留锁定前缀 ${d.locked_prefix} 步，扩展节点 ${d.expanded}）`);
     renderAll();
   } else {
+    const nearest = Array.isArray(d.nearest_state)
+      ? `开度 [${fmt(d.nearest_state)}]，总泄量 ${Number(d.nearest_q).toFixed(1)} m³/s（目标 ${plan.target_q}）`
+      : "（无最近可达状态数据）";
     $("diag").innerHTML = `<div class="diag"><b>无可行路径。</b><br>
-      首个不可满足约束：<b>${d.first_violated}</b> — ${d.detail}<br>
-      最近可达状态：开度 [${fmt(d.nearest_state)}]，总泄量 ${d.nearest_q.toFixed(1)} m³/s
-      （目标 ${plan.target_q}）</div>`;
+      首个不可满足约束：<b>${d.first_violated || "unknown"}</b> — ${d.detail || ""}<br>
+      最近可达状态：${nearest}</div>`;
   }
   loadPlans();
 };

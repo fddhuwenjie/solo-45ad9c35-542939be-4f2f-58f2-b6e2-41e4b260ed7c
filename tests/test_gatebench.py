@@ -97,6 +97,86 @@ class SearchTest(unittest.TestCase):
         self.assertEqual(res.first_violated, "target")
 
 
+class InflowTest(unittest.TestCase):
+    """机组来流必须实际参与路径计算。"""
+
+    def test_inflow_blocks_target(self):
+        # 来流 880 < 目标 900（机组能力足够）：首报机组来流，最近状态 ≤ 来流
+        res = search.find_path(make_gates(), make_bands(), HEAD,
+                               [4.0, 4.0, 4.0, 4.0], 900.0, RAMP, ADJ,
+                               inflow=880.0)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.first_violated, "inflow")
+        self.assertIsNotNone(res.nearest_state)
+        self.assertLessEqual(res.nearest_q, 880.0 + 1e-6)
+
+    def test_inflow_feasible_respected(self):
+        # 来流 950 ≥ 目标 900：路径可行，且每一步泄量都不得超越来流
+        res = search.find_path(make_gates(), make_bands(), HEAD,
+                               [4.0, 4.0, 4.0, 4.0], 900.0, RAMP, ADJ,
+                               inflow=950.0)
+        self.assertTrue(res.ok)
+        for q in res.discharges:
+            self.assertLessEqual(q, 950.0 + 1e-6)
+
+
+class RateGridTest(unittest.TestCase):
+    """速率取整：任何闸门不得因 0.1m 网格突破自身速率限制。"""
+
+    def test_zero_rate_keeps_opening(self):
+        gates = make_gates()
+        gates[1].rate = 0.0  # 2#门零速率：全程必须保持原开度
+        res = search.find_path(gates, make_bands(), HEAD,
+                               [4.0, 4.0, 4.0, 4.0], 900.0, RAMP, ADJ,
+                               inflow=5000.0)
+        self.assertTrue(res.ok)
+        for opens in res.path:
+            self.assertAlmostEqual(opens[1], 4.0, places=9)
+
+    def test_sub_grid_rate_means_fixed(self):
+        gates = make_gates()
+        gates[0].rate = 0.05  # 不足一个网格步：不允许进位成 0.1m/步
+        res = search.find_path(gates, make_bands(), HEAD,
+                               [4.0, 4.0, 4.0, 4.0], 900.0, RAMP, ADJ,
+                               inflow=5000.0)
+        self.assertTrue(res.ok)
+        for opens in res.path:
+            self.assertAlmostEqual(opens[0], 4.0, places=9)
+
+    def test_rate_floor_not_round(self):
+        gates = make_gates()
+        gates[0].rate = 0.15  # 网格化后每步最多 0.1m，不得进位到 0.2m
+        res = search.find_path(gates, make_bands(), HEAD,
+                               [4.0, 4.0, 4.0, 4.0], 900.0, RAMP, ADJ,
+                               inflow=5000.0)
+        self.assertTrue(res.ok)
+        for prev, cur in zip(res.path, res.path[1:]):
+            self.assertLessEqual(abs(cur[0] - prev[0]), 0.15 + 1e-9)
+
+
+class BandInteriorStartTest(unittest.TestCase):
+    """当前开度落在禁振带内：返回最近合法可达状态，诊断字段齐全。"""
+
+    def test_start_inside_band(self):
+        res = search.find_path(make_gates(), make_bands(), HEAD,
+                               [2.6, 4.0, 4.0, 4.0], 900.0, RAMP, ADJ,
+                               inflow=5000.0)  # 1#门 2.6m 处于禁振带 2.0~3.2 内
+        self.assertFalse(res.ok)
+        self.assertEqual(res.first_violated, "start")
+        self.assertIsNotNone(res.nearest_state)
+        self.assertIsNotNone(res.nearest_q)
+        # 最近合法状态不得落在任何适用禁振带内
+        for i, e in enumerate(res.nearest_state):
+            for b in make_bands():
+                if b.gate_id == i + 1:
+                    self.assertFalse(b.open_lo <= e <= b.open_hi,
+                                     f"gate {i+1} still in band: {e}")
+        # 且应满足相邻门开度差
+        for i in range(len(res.nearest_state) - 1):
+            self.assertLessEqual(
+                abs(res.nearest_state[i] - res.nearest_state[i + 1]), ADJ + 1e-6)
+
+
 class ServerTestBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -124,11 +204,11 @@ class ServerTestBase(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read())
 
-    def new_plan(self, target=900.0):
+    def new_plan(self, target=900.0, inflow=5000.0):
         code, d = self.api("/api/plans", "POST", {
-            "name": "t", "head": HEAD, "target_q": target, "ramp": RAMP,
-            "max_adj_diff": ADJ, "start_openings": [4.0, 4.0, 4.0, 4.0],
-            "created_by": "tester"})
+            "name": "t", "head": HEAD, "target_q": target, "inflow": inflow,
+            "ramp": RAMP, "max_adj_diff": ADJ,
+            "start_openings": [4.0, 4.0, 4.0, 4.0], "created_by": "tester"})
         self.assertEqual(code, 201)
         return d["id"]
 
@@ -191,6 +271,18 @@ class PlanFlowTest(ServerTestBase):
         self.assertEqual(r["first_violated"], "target")
         self.assertIn("nearest_state", r)
         self.assertIn("nearest_q", r)
+
+    def test_inflow_via_api(self):
+        # 机组来流贯通到方案数据与求解：来流 880 < 目标 900 → 首报 inflow
+        pid = self.new_plan(target=900.0, inflow=880.0)
+        code, r = self.api(f"/api/plans/{pid}/solve", "POST", {"base_version": 1})
+        self.assertEqual(code, 200)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["first_violated"], "inflow")
+        self.assertLessEqual(r["nearest_q"], 880.0 + 1e-6)
+        # 方案详情应携带来流字段
+        code, detail = self.api(f"/api/plans/{pid}")
+        self.assertEqual(detail["plan"]["inflow"], 880.0)
 
     def test_maintenance_toggle(self):
         code, g = self.api("/api/gates/1/maintenance", "POST", {"locked": True})

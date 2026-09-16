@@ -128,16 +128,17 @@ def make_handler(conn, db_lock: threading.Lock):
                 return self._json(code, out)
             if m == "/api/plans":
                 def _create():
-                    required = ["name", "head", "target_q", "ramp",
+                    required = ["name", "head", "target_q", "inflow", "ramp",
                                 "max_adj_diff", "start_openings"]
                     if any(k not in body for k in required):
                         raise ValueError("missing fields: " + ",".join(required))
                     with conn:
                         cur = conn.execute(
-                            "INSERT INTO plans(name,head,target_q,ramp,max_adj_diff,"
-                            "start_openings,created_by,created_at)"
-                            " VALUES(?,?,?,?,?,?,?,?)",
+                            "INSERT INTO plans(name,head,target_q,inflow,ramp,"
+                            "max_adj_diff,start_openings,created_by,created_at)"
+                            " VALUES(?,?,?,?,?,?,?,?,?)",
                             (body["name"], float(body["head"]), float(body["target_q"]),
+                             float(body["inflow"]),
                              float(body["ramp"]), float(body["max_adj_diff"]),
                              json.dumps(body["start_openings"]),
                              body.get("created_by", ""), db.now()))

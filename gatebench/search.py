@@ -76,15 +76,20 @@ class _Problem:
     """一次搜索的约束上下文；relax 用于诊断时松弛某类约束。"""
 
     def __init__(self, gates, bands, head, ramp, max_adj_diff, start,
-                 relax: str | None = None):
+                 inflow: float = math.inf, relax: str | None = None):
         self.gates = gates
         self.head = head
         self.ramp = ramp
         self.max_adj_diff = max_adj_diff
         self.relax = relax
+        self.inflow = math.inf if relax == "inflow" else inflow
         self.sqrt_h = math.sqrt(head)
         self.max_grid = [int(round(g.max_opening / GRID)) for g in gates]
-        self.rate_steps = [max(1, int(round(g.rate / GRID))) for g in gates]
+        # 速率换算为网格步数必须向下取整：任何闸门都不得因 0.1m 网格
+        # 而突破自身速率限制；速率为 0（或不足一个网格步）时步数为 0，
+        # 该门全程保持原开度。
+        self.rate_steps = [max(0, int(math.floor(g.rate / GRID + 1e-9)))
+                           for g in gates]
 
         # 每门网格级流量贡献与禁振带标记
         self.q_contrib = [[g.coef * i * GRID * self.sqrt_h
@@ -104,11 +109,14 @@ class _Problem:
                     for i in range(max(lo, 0), min(hi, self.max_grid[k]) + 1):
                         self.in_band[k][i] = True
 
-        # 把每门钳制到起点所在的连通区间（禁振带不可穿越）
+        # 把每门钳制到起点所在的连通区间（禁振带不可穿越）；
+        # 检修锁定门与零速率门（无法移动）直接钳制到起点
         self.lo = [0] * len(gates)
         self.hi = list(self.max_grid)
         for k in range(len(gates)):
-            if gates[k].locked and relax != "maintenance":
+            fixed = ((gates[k].locked and relax != "maintenance")
+                     or (self.rate_steps[k] == 0 and relax != "rate"))
+            if fixed:
                 self.lo[k] = self.hi[k] = start[k]
                 continue
             s = start[k]
@@ -125,8 +133,10 @@ class _Problem:
 
         # 预构建与状态无关的步长组合（远离目标用粗步长；接近目标时
         # 粗步长 ∪ ±1 细步长——泄量分辨率足够，组合数从 5^n 降到约 2·3^n；
-        # 诊断松弛速率时按 4 倍速率近似"取消速率限制"）
-        r_of = [self.rate_steps[k] if relax != "rate" else self.rate_steps[k] * 4
+        # 诊断松弛速率时按 4 倍速率近似"取消速率限制"，零速率门给 4 步）。
+        # 细步长同样逐门受速率约束，零速率门在任何组合中都保持不动。
+        r_of = [self.rate_steps[k] if relax != "rate"
+                else (self.rate_steps[k] * 4 if self.rate_steps[k] > 0 else 4)
                 for k in range(len(gates))]
 
         def build(movesets):
@@ -135,7 +145,8 @@ class _Problem:
 
         self._coarse_combos = build([(-r, 0, r) for r in r_of])
         self._fine_combos = (self._coarse_combos
-                             + build([(-1, 0, 1)] * len(gates)))
+                             + build([(min(1, r), 0, -min(1, r))
+                                      for r in r_of]))
         # 相邻门开度差检查的门对（网格步数上限）
         self._pairs = [(k, k + 1) for k in range(len(gates) - 1)]
         self._max_adj_grid = max_adj_diff / GRID
@@ -157,11 +168,13 @@ class _Problem:
         return lo, hi
 
     def neighbors(self, state: tuple[int, ...], q: float, target_q: float):
-        """生成满足全部单步约束的后继（泄量爬升率、相邻开度差在此内联检查）。"""
+        """生成满足全部单步约束的后继（泄量爬升率、机组来流上限、
+        相邻开度差在此内联检查）。"""
         combos = (self._fine_combos
                   if abs(q - target_q) <= 2 * self.ramp else self._coarse_combos)
         lo, hi, qc = self.lo, self.hi, self.q_contrib
         ramp = self.ramp if self.relax != "ramp" else math.inf
+        inflow = self.inflow
         check_adj = self.relax != "adj_diff"
         max_adj = self._max_adj_grid
         for deltas in combos:
@@ -175,7 +188,7 @@ class _Problem:
                     break
                 nxt.append(n)
                 nq += qc[k][n] - qc[k][state[k]]
-            if not ok or abs(nq - q) > ramp + 1e-9:
+            if not ok or abs(nq - q) > ramp + 1e-9 or nq > inflow + 1e-9:
                 continue
             if check_adj:
                 for a, b in self._pairs:
@@ -223,6 +236,7 @@ def _astar(prob: _Problem, start: tuple[int, ...], target_q: float):
 
 # 诊断时的松弛顺序：先报告的即"首个"不可满足约束
 _RELAX_ORDER = [
+    ("inflow", "机组来流：目标泄量超过机组来流可供能力"),
     ("maintenance", "检修锁定：锁定门开度固定，目标泄量在当前可调范围内无法达成"),
     ("band", "禁振开度带：目标泄量对应开度落在禁振带内，或起终点被禁振带隔离"),
     ("adj_diff", "相邻门开度差限制：满足开度差约束的状态空间内不存在可达目标的路径"),
@@ -231,12 +245,14 @@ _RELAX_ORDER = [
 ]
 
 
-def _diagnose(gates, bands, head, start, target_q, ramp, max_adj_diff):
+def _diagnose(gates, bands, head, start, target_q, ramp, max_adj_diff, inflow):
     """逐一松弛约束，返回 (首个不可满足约束key, 说明)。"""
     for key, msg in _RELAX_ORDER:
-        prob = _Problem(gates, bands, head, ramp, max_adj_diff, start, relax=key)
+        prob = _Problem(gates, bands, head, ramp, max_adj_diff, start,
+                        inflow=inflow, relax=key)
         lo, hi = prob.q_range()
-        if not (lo - Q_TOL <= target_q <= hi + Q_TOL):
+        hi_eff = min(hi, prob.inflow)
+        if not (lo - Q_TOL <= target_q <= hi_eff + Q_TOL):
             continue  # 松弛后泄量区间仍不含目标，换下一约束
         path, _, _, _ = _astar(prob, start, target_q)
         if path is not None:
@@ -244,30 +260,115 @@ def _diagnose(gates, bands, head, start, target_q, ramp, max_adj_diff):
     return "target", "即使松弛全部运行约束仍不可达：目标泄量超出机组来流能力范围。"
 
 
+def _legalize_start(prob: _Problem, start: tuple[int, ...]) -> tuple[int, ...]:
+    """把落在禁振带内的各门移到最近合法开度，并尽量修复相邻开度差。
+
+    用于"当前开度已在禁振带内"时的最近合法状态提示。
+    """
+    n = len(start)
+    in_band, max_grid = prob.in_band, prob.max_grid
+
+    def nearest_legal(k, g, lo=0, hi=None):
+        hi = max_grid[k] if hi is None else min(hi, max_grid[k])
+        lo = max(lo, 0)
+        g = min(max(g, lo), hi)
+        if not in_band[k][g]:
+            return g
+        for d in range(1, max_grid[k] + 1):
+            if g + d <= hi and not in_band[k][g + d]:
+                return g + d
+            if g - d >= lo and not in_band[k][g - d]:
+                return g - d
+        return g  # 窗口内无合法点开度（理论上不会发生）
+
+    st = [nearest_legal(k, start[k]) for k in range(n)]
+    limit = prob._max_adj_grid
+    for _ in range(2 * n):
+        changed = False
+        for a, b in prob._pairs:
+            if abs(st[a] - st[b]) <= limit + 1e-9:
+                continue
+            # 把偏离更大的一侧拉向另一侧的允许窗口
+            if st[b] - st[a] > limit:
+                k, other = b, a
+            else:
+                k, other = a, b
+            lo_w = int(math.ceil(st[other] - limit - 1e-9))
+            hi_w = int(math.floor(st[other] + limit + 1e-9))
+            new_v = nearest_legal(k, st[k], lo_w, hi_w)
+            if new_v != st[k]:
+                st[k] = new_v
+                changed = True
+        if not changed:
+            break
+    return tuple(st)
+
+
+def _nearest_under_inflow(prob: _Problem) -> tuple[tuple[int, ...], float]:
+    """机组来流受限时的最近可达状态：从各门上限均衡下调至 Q ≤ 来流。"""
+    n = len(prob.lo)
+    st = [prob.hi[k] for k in range(n)]
+    q = prob.q_of(tuple(st))
+    if q <= prob.inflow + 1e-9:
+        return tuple(st), q
+    limit = prob._max_adj_grid
+    while q > prob.inflow + 1e-9:
+        moved = False
+        # 优先降当前开度最大的门，保持各门均衡（不破坏相邻差）
+        for k in sorted(range(n), key=lambda k: -st[k]):
+            if st[k] <= prob.lo[k]:
+                continue
+            if prob.relax != "adj_diff" and any(
+                    abs((st[k] - 1) - st[j]) > limit + 1e-9
+                    for j in (k - 1, k + 1) if 0 <= j < n):
+                continue
+            st[k] -= 1
+            q -= prob.q_contrib[k][st[k] + 1] - prob.q_contrib[k][st[k]]
+            moved = True
+            break
+        if not moved:
+            break
+    return tuple(st), q
+
+
 def find_path(gates: list[Gate], bands: list[Band], head: float,
               start_openings, target_q: float, ramp: float,
-              max_adj_diff: float) -> SearchResult:
+              max_adj_diff: float, inflow: float = math.inf) -> SearchResult:
     start = _to_grid(start_openings)
-    prob = _Problem(gates, bands, head, ramp, max_adj_diff, start)
+    prob = _Problem(gates, bands, head, ramp, max_adj_diff, start, inflow=inflow)
     if any(prob.in_band[k][start[k]] for k in range(len(start))):
-        return SearchResult(ok=False, first_violated="start",
-                            detail="当前开度处于禁振带内，请先人工调整出禁振区。")
+        # 当前开度已在禁振带内：给出最近的合法可达状态及对应泄量
+        legal = _legalize_start(prob, start)
+        return SearchResult(
+            ok=False, first_violated="start",
+            detail="当前开度处于禁振带内，请先调整至最近的合法开度。",
+            nearest_state=list(_to_meters(legal)),
+            nearest_q=round(prob.q_of(legal), 3))
     if not prob.state_ok(start):
+        legal = _legalize_start(prob, start)
         return SearchResult(ok=False, first_violated="start",
-                            detail="当前开度违反相邻门开度差约束，请先人工调整。")
+                            detail="当前开度违反相邻门开度差约束，请先人工调整。",
+                            nearest_state=list(_to_meters(legal)),
+                            nearest_q=round(prob.q_of(legal), 3))
 
     lo_q, hi_q = prob.q_range()
-    if not (lo_q - Q_TOL <= target_q <= hi_q + Q_TOL):
+    hi_eff = min(hi_q, prob.inflow)
+    if not (lo_q - Q_TOL <= target_q <= hi_eff + Q_TOL):
         # 快速失败：目标在可达泄量区间之外，最近可达状态为区间端点
-        below = target_q < lo_q
-        nearest = tuple(prob.lo[k] if below else prob.hi[k]
-                        for k in range(len(start)))
+        if target_q < lo_q:
+            nearest = tuple(prob.lo[k] for k in range(len(start)))
+            nearest_q = prob.q_of(nearest)
+        elif prob.inflow < hi_q:
+            nearest, nearest_q = _nearest_under_inflow(prob)
+        else:
+            nearest = tuple(prob.hi[k] for k in range(len(start)))
+            nearest_q = hi_q
         key, msg = _diagnose(gates, bands, head, start, target_q,
-                             ramp, max_adj_diff)
+                             ramp, max_adj_diff, inflow)
         return SearchResult(
             ok=False, first_violated=key, detail=msg,
             nearest_state=list(_to_meters(nearest)),
-            nearest_q=round(prob.q_of(nearest), 3))
+            nearest_q=round(nearest_q, 3))
 
     path, expanded, nearest, nearest_q = _astar(prob, start, target_q)
     if path is not None:
@@ -275,7 +376,8 @@ def find_path(gates: list[Gate], bands: list[Band], head: float,
             ok=True, expanded=expanded,
             path=[_to_meters(s) for s in path],
             discharges=[round(prob.q_of(s), 3) for s in path])
-    key, msg = _diagnose(gates, bands, head, start, target_q, ramp, max_adj_diff)
+    key, msg = _diagnose(gates, bands, head, start, target_q,
+                         ramp, max_adj_diff, inflow)
     return SearchResult(
         ok=False, expanded=expanded, first_violated=key, detail=msg,
         nearest_state=list(_to_meters(nearest)), nearest_q=round(nearest_q, 3))

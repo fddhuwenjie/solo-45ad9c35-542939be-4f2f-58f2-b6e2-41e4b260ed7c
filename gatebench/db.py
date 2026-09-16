@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS plans (
     name TEXT NOT NULL,
     head REAL NOT NULL,
     target_q REAL NOT NULL,
+    inflow REAL NOT NULL DEFAULT 1000000,  -- 机组来流 m³/s（泄量上限）
     ramp REAL NOT NULL,          -- 总泄量爬升率 m³/s/步
     max_adj_diff REAL NOT NULL,  -- 相邻门开度差上限（米）
     start_openings TEXT NOT NULL,  -- JSON 数组
@@ -66,7 +67,17 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对既有库做就地迁移：plans 增加机组来流列（默认足够大，不改变旧方案语义）。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(plans)")}
+    if "inflow" not in cols:
+        conn.execute(
+            "ALTER TABLE plans ADD COLUMN inflow REAL NOT NULL DEFAULT 1000000")
+        conn.commit()
 
 
 def seed_if_empty(conn: sqlite3.Connection) -> None:
@@ -89,6 +100,7 @@ def plan_digest(plan: sqlite3.Row, steps: list[sqlite3.Row]) -> str:
         "name": plan["name"],
         "head": plan["head"],
         "target_q": plan["target_q"],
+        "inflow": plan["inflow"],
         "ramp": plan["ramp"],
         "max_adj_diff": plan["max_adj_diff"],
         "start_openings": json.loads(plan["start_openings"]),
